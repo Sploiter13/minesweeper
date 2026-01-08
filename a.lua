@@ -19,6 +19,8 @@ local MathMax = math.max
 local MathMin = math.min
 local MathPow = math.pow
 local MathHuge = math.huge
+local MathLog = math.log
+local MathExp = math.exp
 
 local TableCreate = table.create
 local TableClear = table.clear
@@ -73,8 +75,17 @@ local HARD_EQ_CAP: number = 512
 local MAX_CLUSTER_VARS: number = 22
 local MAX_BACKTRACK_SOLUTIONS: number = 50000
 
+local RISK_EPSILON: number = 1e-9
+local FALLBACK_RISK: number = 0.5
+local MAX_ENTROPY_CANDIDATES: number = 10
+local MAX_LOOKAHEAD_VARS: number = 22
+local MAX_LOOKAHEAD_CANDIDATES: number = 6
+local USE_ENTROPY_TIEBREAK: boolean = true
+local LOOKAHEAD_ENABLED: boolean = true
+
 local COLOR_MINE: Color3 = Color3.fromRGB(255, 40, 40)
 local COLOR_SAFE: Color3 = Color3.fromRGB(50, 255, 50)
+local COLOR_BEST: Color3 = Color3.fromRGB(0, 255, 255)
 local COLOR_STATUS_ON: Color3 = Color3.fromRGB(60, 255, 60)
 local COLOR_STATUS_OFF: Color3 = Color3.fromRGB(255, 60, 60)
 
@@ -116,7 +127,8 @@ export type TileData = {
     flagged: boolean,
     probability: number?,
     hasRevealedNeighbor: boolean?,
-    constraintCount: number?
+    constraintCount: number?,
+    storedPos: Vector3?
 }
 
 export type AutoFlagEntry = {
@@ -133,6 +145,13 @@ export type CandidateData = {
 export type Equation = {
     needed: number,
     vars: {number}
+}
+
+export type TankSystem = {
+    unknownMap: {[TileData]: number},
+    unknownList: {TileData},
+    equations: {Equation},
+    varToEqIndex: {{number}}
 }
 
 ---- variables ----
@@ -171,7 +190,11 @@ local RenderCount: number = 0
 local FrontierTiles: {TileData} = TableCreate(200)
 local FrontierCount: number = 0
 
----- functions ----
+local BestMove: TileData? = nil
+local BestMoveRisk: number = 1
+local LastTankSystem: TankSystem? = nil
+
+---- helper functions ----
 
 local function AcquireTable(): {any}
     local poolSize: number = #TablePool
@@ -313,6 +336,24 @@ local function GetDistance2D(x1: number, y1: number, x2: number, y2: number): nu
     return MathSqrt(dx * dx + dy * dy)
 end
 
+local function GetRefPosition(): Vector3?
+    if HumanoidRootPart and ValidateParent(HumanoidRootPart) then
+        local success: boolean, pos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
+        if success and pos then
+            return pos
+        end
+    end
+    
+    if Camera then
+        local success: boolean, pos: Vector3? = SafeGetProperty(Camera, "Position")
+        if success and pos then
+            return pos
+        end
+    end
+    
+    return Vector3.new(0, 0, 0)
+end
+
 local function PosToKey(part: BasePart?): (string?, number?, number?)
     if not ValidateParent(part) then return nil, nil, nil end
     
@@ -426,6 +467,8 @@ local function GenerateTile(part: BasePart): ()
     
     local tileType: string, val: number? = ClassifyTile(part)
     
+    local posSuccess: boolean, pos: Vector3? = SafeGetProperty(part, "Position")
+    
     local t: TileData = {
         part = part,
         gx = gx,
@@ -436,7 +479,8 @@ local function GenerateTile(part: BasePart): ()
         flagged = false,
         probability = nil,
         hasRevealedNeighbor = nil,
-        constraintCount = 0
+        constraintCount = 0,
+        storedPos = posSuccess and pos or nil
     }
     
     TileCount = TileCount + 1
@@ -789,6 +833,165 @@ local function BuildFrontier(): ()
     end
 end
 
+local function GetTileRisk(tile: TileData): number
+    if tile.predicted == "mine" then return 1 end
+    if tile.predicted == "safe" then return 0 end
+    if tile.probability ~= nil then return tile.probability end
+    return FALLBACK_RISK
+end
+
+local function Entropy(dist: {number}): number
+    local h: number = 0
+    for i = 1, #dist do
+        local p: number = dist[i]
+        if p and p > 0 then
+            h = h - (p * MathLog(p))
+        end
+    end
+    return h
+end
+
+local function EstimateNeighborMineCountDist(tile: TileData): {number}
+    local neighbors: {TileData} = GetNeighborsCopy(tile)
+    local baseMines: number = 0
+    local probs: {number} = TableCreate(8)
+    local probCount: number = 0
+    
+    for i = 1, #neighbors do
+        local n: TileData = neighbors[i]
+        if n.tileType == "mine" or n.predicted == "mine" then
+            baseMines = baseMines + 1
+        elseif n.tileType == "unknown" and n.predicted ~= "safe" then
+            probCount = probCount + 1
+            probs[probCount] = GetTileRisk(n)
+        end
+    end
+    
+    local dist: {[number]: number} = { [0] = 1 }
+    
+    for i = 1, probCount do
+        local p: number = probs[i]
+        local nextDist: {[number]: number} = {}
+        
+        for k, v in pairs(dist) do
+            nextDist[k] = (nextDist[k] or 0) + v * (1 - p)
+            nextDist[k + 1] = (nextDist[k + 1] or 0) + v * p
+        end
+        
+        dist = nextDist
+    end
+    
+    local out: {number} = TableCreate(9)
+    for k = 0, 8 do
+        out[k + 1] = 0
+    end
+    
+    for k, v in pairs(dist) do
+        local kk: number = k + baseMines
+        if kk >= 0 and kk <= 8 then
+            out[kk + 1] = out[kk + 1] + v
+        end
+    end
+    
+    local s: number = 0
+    for i = 1, #out do
+        s = s + out[i]
+    end
+    
+    if s > 0 then
+        for i = 1, #out do
+            out[i] = out[i] / s
+        end
+    end
+    
+    return out
+end
+
+local function PickBestMove(): (TileData?, number)
+    local bestRisk: number = 2
+    local candidates: {TileData} = TableCreate(100)
+    local candidateCount: number = 0
+    
+    for i = 1, TileCount do
+        local t: TileData = Tiles[i]
+        
+        if t.tileType == "unknown" and t.predicted ~= "mine" then
+            local r: number = t.probability or FALLBACK_RISK
+            if t.predicted == "safe" then r = 0 end
+            
+            if r < bestRisk - RISK_EPSILON then
+                bestRisk = r
+                candidateCount = 1
+                candidates[1] = t
+            elseif MathAbs(r - bestRisk) <= RISK_EPSILON then
+                candidateCount = candidateCount + 1
+                candidates[candidateCount] = t
+            end
+        end
+    end
+    
+    if candidateCount == 0 then
+        return nil, 1
+    end
+    
+    local refPos: Vector3? = GetRefPosition()
+    
+    if candidateCount > 1 and refPos then
+        TableSort(candidates, function(a: TileData, b: TileData): boolean
+            local posA: Vector3? = a.storedPos
+            local posB: Vector3? = b.storedPos
+            
+            if not posA then return false end
+            if not posB then return true end
+            
+            local distA: number = (posA - refPos).Magnitude
+            local distB: number = (posB - refPos).Magnitude
+            
+            return distA < distB
+        end)
+    end
+    
+    if bestRisk == 0 then
+        return candidates[1], 0
+    end
+    
+    local bestTile: TileData = candidates[1]
+    local bestScore: number = -1
+    local maxC: number = MathMin(candidateCount, MAX_LOOKAHEAD_CANDIDATES)
+    
+    for i = 1, maxC do
+        local t: TileData = candidates[i]
+        local s: number? = nil
+        
+        if USE_ENTROPY_TIEBREAK then
+            local dist: {number} = EstimateNeighborMineCountDist(t)
+            local risk: number = t.probability or FALLBACK_RISK
+            s = (1 - risk) * Entropy(dist)
+        end
+        
+        if not s then
+            local open: number = 0
+            local neighbors: {TileData} = GetNeighborsCopy(t)
+            
+            for j = 1, #neighbors do
+                local n: TileData = neighbors[j]
+                if n.tileType == "unknown" and n.predicted ~= "mine" then
+                    open = open + 1
+                end
+            end
+            
+            s = open * 0.01
+        end
+        
+        if s > bestScore then
+            bestScore = s
+            bestTile = t
+        end
+    end
+    
+    return bestTile, bestRisk
+end
+
 local function RunTankSolver(): boolean
     local madeProgress: boolean = false
     
@@ -849,6 +1052,13 @@ local function RunTankSolver(): boolean
             list[#list + 1] = eqIdx
         end
     end
+    
+    LastTankSystem = {
+        unknownMap = unknownMap,
+        unknownList = unknownList,
+        equations = equations,
+        varToEqIndex = varToEqIndex
+    }
     
     local visitedVars: {[number]: boolean} = {}
     local clusters: {{vars: {number}, eqs: {Equation}}} = TableCreate(10)
@@ -1210,6 +1420,8 @@ local function SolveAll(): ()
             if not RunTrivialPass() then break end
         end
     end
+    
+    BestMove, BestMoveRisk = PickBestMove()
 end
 
 local function VerifyPendingFlags(): ()
@@ -1503,6 +1715,14 @@ local function ReclassifyTiles(): ()
             t.tileType = newType
             t.number = newNumber
             t.hasRevealedNeighbor = nil
+            
+            if t.part and ValidateParent(t.part) then
+                local posSuccess: boolean, pos: Vector3? = SafeGetProperty(t.part, "Position")
+                if posSuccess and pos then
+                    t.storedPos = pos
+                end
+            end
+            
             SolverChanged = true
         end
     end
@@ -1625,7 +1845,25 @@ local function SafeRender(): ()
     local statusColor: Color3 = _G.MS_AUTOFLAG and COLOR_STATUS_ON or COLOR_STATUS_OFF
     local statusText: string = _G.MS_AUTOFLAG and "AUTO-FLAG: ON (X)" or "AUTO-FLAG: OFF (X)"
     
-    SafeDrawText(VectorCreate(12, 805), 16, statusColor, 1, statusText, false)
+    SafeDrawText(VectorCreate(12, 805, 0), 16, statusColor, 1, statusText, false)
+    
+    if BestMove and BestMove.part and ValidateParent(BestMove.part) then
+        local success: boolean, pos: Vector3? = SafeGetProperty(BestMove.part, "Position")
+        
+        if success and pos then
+            local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, pos)
+            
+            if screenPos and onScreen then
+                local riskText: string = "BEST"
+                if BestMoveRisk > 0 then
+                    local pct: number = MathFloor(BestMoveRisk * 100 + 0.5)
+                    riskText = "BEST (" .. tostring(pct) .. "%)"
+                end
+                
+                SafeDrawText(VectorCreate(screenPos.X, screenPos.Y - 30, 0), 18, COLOR_BEST, 1, riskText, true)
+            end
+        end
+    end
     
     local renderCount: number = RenderCount
     if renderCount <= 0 then return end
@@ -1640,7 +1878,7 @@ local function SafeRender(): ()
                 local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, pos)
                 
                 if screenPos and onScreen then
-                    local screenVec: vector = VectorCreate(screenPos.X, screenPos.Y)
+                    local screenVec: vector = VectorCreate(screenPos.X, screenPos.Y, 0)
                     
                     if t.predicted == "mine" then
                         SafeDrawText(screenVec, 22, COLOR_MINE, 1, "M", true)
@@ -1670,7 +1908,7 @@ RunService.PostModel:Connect(function(): ()
     Pcall(SafePostModel)
 end)
 
-RunService.PreLocal:Connect(function(): ()
+RunService.PostLocal:Connect(function(): ()
     Pcall(SafePreLocal)
 end)
 
