@@ -1,14 +1,14 @@
 --!native
 --!optimize 2
 
-memory.set_write_strength(0.0001)
+memory.set_write_strength(0.001) --change this based on your severe mode, this is good for me for high end mode
 
 ---- environment ----
 local loadSuccess: boolean = pcall(function()
     loadstring(game:HttpGet("https://raw.githubusercontent.com/Sploiter13/severefuncs/refs/heads/main/merge2.lua"))()
 end)
 
-task.wait(1)
+task.wait(0.5)
 
 local RunService = game:GetService("RunService")
 local Players = game:GetService("Players")
@@ -57,12 +57,12 @@ local ORIGIN_Y: number = 70
 local ORIGIN_Z: number = 0
 
 local LOGIC_INTERVAL: number = 0.01
-local SCAN_INTERVAL: number = 0.5
+local SCAN_INTERVAL: number = 0.6
 local SCAN_TICKS: number = MathMax(1, MathFloor(SCAN_INTERVAL / LOGIC_INTERVAL))
 
-local CLEANUP_INTERVAL: number = 30
-local CLEANUP_POOL_MAX: number = 32
-local STALE_TILE_CHECK_INTERVAL: number = 10
+local CLEANUP_INTERVAL: number = 45
+local CLEANUP_POOL_MAX: number = 24
+local STALE_TILE_CHECK_INTERVAL: number = 12
 
 local AUTOFLAG_TOGGLE_KEY: string = "X"
 local AUTOWALK_TOGGLE_KEY: string = "C"
@@ -72,13 +72,16 @@ local AUTOFLAG_VERIFY_DELAY: number = 0.15
 local AUTOFLAG_SMOOTHNESS: number = 0.6
 local AUTOFLAG_CLICK_TOLERANCE: number = 6
 
-local WALK_ARRIVAL_DIST: number = 1.8
-local WALK_REPATH_DELAY: number = 0.25
-local WALK_HUMANIZE_VARIANCE: number = 0.06
-local WALK_JUMP_CHANCE: number = 0.12
-local WALK_DIRECTION_SMOOTHING: number = 0.75
-local WALK_PATH_UPDATE_INTERVAL: number = 0.15
-local WALK_JUMP_COOLDOWN: number = 0.3
+local WALK_ARRIVAL_DIST: number = 1.6
+local WALK_HUMANIZE_VARIANCE: number = 0.08
+local WALK_JUMP_BASE_CHANCE: number = 0.04
+local WALK_JUMP_MIN_DISTANCE: number = 10
+local WALK_JUMP_MIN_NODES: number = 3
+local WALK_DIRECTION_SMOOTHING: number = 0.82
+local WALK_PATH_UPDATE_INTERVAL: number = 0.18
+local WALK_JUMP_COOLDOWN_MIN: number = 0.4
+local WALK_JUMP_COOLDOWN_MAX: number = 0.7
+local WALK_DIRECTION_CHANGE_THRESHOLD: number = 0.3
 
 local NEIGHBOR_OFFSETS: {{number}} = {
     {-1, -1}, {-1, 0}, {-1, 1},
@@ -192,7 +195,9 @@ export type WalkState = {
     lastRepath: number,
     lastPathUpdate: number,
     lastJump: number,
+    nextJumpCooldown: number,
     currentDirection: vector,
+    lastDirection: vector,
     abortToken: number
 }
 
@@ -251,7 +256,9 @@ local WalkData: WalkState = {
     lastRepath = 0,
     lastPathUpdate = 0,
     lastJump = 0,
+    nextJumpCooldown = 0.3,
     currentDirection = VectorCreate(0, 0, 0),
+    lastDirection = VectorCreate(0, 0, 0),
     abortToken = 0
 }
 
@@ -890,11 +897,25 @@ end
 local function ApplyMoveDirection(dirX: number, dirZ: number): boolean
     if not Humanoid then return false end
     
-    local smoothedX: number = WalkData.currentDirection.X + (dirX - WalkData.currentDirection.X) * WALK_DIRECTION_SMOOTHING
-    local smoothedZ: number = WalkData.currentDirection.Z + (dirZ - WalkData.currentDirection.Z) * WALK_DIRECTION_SMOOTHING
+    local directionChange: number = MathAbs(dirX - WalkData.lastDirection.X) + MathAbs(dirZ - WalkData.lastDirection.Z)
     
-    smoothedX = AddHumanVariance(smoothedX, WALK_HUMANIZE_VARIANCE)
-    smoothedZ = AddHumanVariance(smoothedZ, WALK_HUMANIZE_VARIANCE)
+    local smoothingFactor: number = WALK_DIRECTION_SMOOTHING
+    if directionChange > WALK_DIRECTION_CHANGE_THRESHOLD then
+        smoothingFactor = smoothingFactor * 0.7
+    end
+    
+    local smoothedX: number = WalkData.currentDirection.X + (dirX - WalkData.currentDirection.X) * smoothingFactor
+    local smoothedZ: number = WalkData.currentDirection.Z + (dirZ - WalkData.currentDirection.Z) * smoothingFactor
+    
+    local varianceAmount: number = WALK_HUMANIZE_VARIANCE * (1 + MathRandom() * 0.3)
+    smoothedX = AddHumanVariance(smoothedX, varianceAmount)
+    smoothedZ = AddHumanVariance(smoothedZ, varianceAmount)
+    
+    local mag: number = MathSqrt(smoothedX * smoothedX + smoothedZ * smoothedZ)
+    if mag > 1.1 then
+        smoothedX = smoothedX / mag
+        smoothedZ = smoothedZ / mag
+    end
     
     local success: boolean = Pcall(function()
         Humanoid.MoveDirection = Vector3.new(smoothedX, 0, smoothedZ)
@@ -902,6 +923,7 @@ local function ApplyMoveDirection(dirX: number, dirZ: number): boolean
     
     if success then
         WalkData.currentDirection = VectorCreate(smoothedX, 0, smoothedZ)
+        WalkData.lastDirection = VectorCreate(dirX, 0, dirZ)
     end
     
     return success
@@ -911,7 +933,7 @@ local function TriggerJump(): boolean
     if not Humanoid then return false end
     
     local currentTime: number = OsClock()
-    if currentTime - WalkData.lastJump < WALK_JUMP_COOLDOWN then
+    if currentTime - WalkData.lastJump < WalkData.nextJumpCooldown then
         return false
     end
     
@@ -921,6 +943,7 @@ local function TriggerJump(): boolean
     
     if success then
         WalkData.lastJump = currentTime
+        WalkData.nextJumpCooldown = WALK_JUMP_COOLDOWN_MIN + MathRandom() * (WALK_JUMP_COOLDOWN_MAX - WALK_JUMP_COOLDOWN_MIN)
     end
     
     return success
@@ -932,6 +955,7 @@ local function AbortCurrentWalk(): ()
     WalkData.pathIndex = 1
     WalkData.targetTile = nil
     WalkData.abortToken = WalkData.abortToken + 1
+    WalkData.lastDirection = VectorCreate(0, 0, 0)
     HaltMovement()
 end
 
@@ -1037,14 +1061,18 @@ local function ExecuteWalkMovement(): ()
     
     local dx: number = targetWorld.X - charPos.X
     local dz: number = targetWorld.Z - charPos.Z
+    local distToTarget: number = MathSqrt(dx * dx + dz * dz)
     
     local dirX: number, dirZ: number = NormalizeVector2D(dx, dz)
     
     ApplyMoveDirection(dirX, dirZ)
     
     local nodesRemaining: number = #WalkData.path - WalkData.pathIndex
-    if nodesRemaining > 1 and MathRandom() < WALK_JUMP_CHANCE then
-        TriggerJump()
+    
+    if nodesRemaining >= WALK_JUMP_MIN_NODES and distToTarget >= WALK_JUMP_MIN_DISTANCE then
+        if MathRandom() < WALK_JUMP_BASE_CHANCE then
+            TriggerJump()
+        end
     end
 end
 
@@ -2534,10 +2562,8 @@ local function SafeRender(): ()
     SafeDrawText(VectorCreate(12, 805, 0), 16, walkColor, 1, walkText, false)
     
     if BestMove and BestMove.part and CheckParentValid(BestMove.part) then
-        local success: boolean, pos: Vector3? = SafeGetProperty(BestMove.part, "Position")
-        
-        if success and pos then
-            local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, pos)
+        if BestMove.storedPos then
+            local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, BestMove.storedPos)
             
             if screenPos and onScreen then
                 local riskText: string = "BEST"
@@ -2557,30 +2583,26 @@ local function SafeRender(): ()
     for i = 1, renderCount do
         local t: TileData? = RenderData[i]
         
-        if t and t.part and CheckParentValid(t.part) then
-            local success: boolean, pos: Vector3? = SafeGetProperty(t.part, "Position")
+        if t and t.storedPos then
+            local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, t.storedPos)
             
-            if success and pos then
-                local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, pos)
+            if screenPos and onScreen then
+                local screenVec: vector = VectorCreate(screenPos.X, screenPos.Y, 0)
                 
-                if screenPos and onScreen then
-                    local screenVec: vector = VectorCreate(screenPos.X, screenPos.Y, 0)
+                if t.predicted == "mine" then
+                    SafeDrawText(screenVec, 22, COLOR_MINE, 1, "M", true)
+                elseif t.predicted == "safe" then
+                    SafeDrawText(screenVec, 22, COLOR_SAFE, 1, "S", true)
+                elseif t.probability and t.probability > 0 and t.probability < 1 then
+                    local pct: number = MathFloor(t.probability * 100 + 0.5)
+                    if pct <= 0 then pct = 1 end
+                    if pct >= 100 then pct = 99 end
                     
-                    if t.predicted == "mine" then
-                        SafeDrawText(screenVec, 22, COLOR_MINE, 1, "M", true)
-                    elseif t.predicted == "safe" then
-                        SafeDrawText(screenVec, 22, COLOR_SAFE, 1, "S", true)
-                    elseif t.probability and t.probability > 0 and t.probability < 1 then
-                        local pct: number = MathFloor(t.probability * 100 + 0.5)
-                        if pct <= 0 then pct = 1 end
-                        if pct >= 100 then pct = 99 end
-                        
-                        local probColor: Color3? = PROB_COLORS[pct]
-                        local probText: string? = PROB_TEXTS[pct]
-                        
-                        if probColor and probText then
-                            SafeDrawText(screenVec, 22, probColor, 1, probText, true)
-                        end
+                    local probColor: Color3? = PROB_COLORS[pct]
+                    local probText: string? = PROB_TEXTS[pct]
+                    
+                    if probColor and probText then
+                        SafeDrawText(screenVec, 22, probColor, 1, probText, true)
                     end
                 end
             end
