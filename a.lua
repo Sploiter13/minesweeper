@@ -3137,6 +3137,55 @@ local function Initialize(): ()
     PrepareRenderData()
 end
 
+local LastCameraUpdateTime: number = 0
+local LastCharacterPosition: Vector3? = nil
+local CAMERA_UPDATE_INTERVAL: number = 5
+
+local function UpdateTopDownCamera(): ()
+    if not _G.MS_AUTOFLAG then
+        LastCharacterPosition = nil
+        return
+    end
+    
+    local cam = workspace.CurrentCamera
+    if not cam then return end
+    
+    if not HumanoidRootPart or not CheckParentValid(HumanoidRootPart) then
+        LastCharacterPosition = nil
+        return
+    end
+    
+    local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
+    if not posSuccess or not charPos then return end
+    
+    local currentTime: number = OsClock()
+    local shouldUpdate: boolean = false
+    
+    -- First time or respawn/new round (position changed drastically)
+    if not LastCharacterPosition then
+        shouldUpdate = true
+    elseif currentTime - LastCameraUpdateTime >= CAMERA_UPDATE_INTERVAL then
+        shouldUpdate = true
+    else
+        -- Check for respawn/teleport (large position change)
+        local dx: number = charPos.X - LastCharacterPosition.X
+        local dy: number = charPos.Y - LastCharacterPosition.Y
+        local dz: number = charPos.Z - LastCharacterPosition.Z
+        local distSq: number = dx * dx + dy * dy + dz * dz
+        
+        if distSq > 400 then -- More than 20 studs = likely respawn/teleport
+            shouldUpdate = true
+        end
+    end
+    
+    if shouldUpdate then
+        cam.CFrame = CFrame.new(charPos.X, charPos.Y + 50, charPos.Z) * CFrame.Angles(-math.pi/2, 0, 0)
+        LastCameraUpdateTime = currentTime
+    end
+    
+    LastCharacterPosition = charPos
+end
+
 ---- runtime ----
 
 local function SafeDrawText(position: vector, size: number, color: Color3, transparency: number, text: string, centered: boolean): ()
@@ -3223,6 +3272,7 @@ local function SafePostLocal(): ()
     
     Pcall(UpdateReferences)
     Pcall(ProcessInput)
+    Pcall(UpdateTopDownCamera)
     Pcall(ProcessAutoFlag)
     Pcall(ExecuteWalkMovement)
     Pcall(UpdateWalkPath)
