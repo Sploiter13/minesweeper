@@ -118,8 +118,9 @@ local WALK_MAX_STUCK_TIME: number = 2.0
 local WALK_REPATH_COOLDOWN: number = 0.5
 local WALK_TARGET_REACHED_DIST: number = 3.0
 local WALK_MAX_RISKY_PROBABILITY: number = 0.20  
-local WALK_RISKY_TILE_COST: number = 50 
-
+local WALK_RISKY_TILE_COST: number = 50
+local WALK_IDLE_RETRY_INTERVAL: number = 0.5
+local LastWalkRetryTime: number = 0
 
 local NEIGHBOR_OFFSETS: {{number}} = {
     {-1, -1}, {-1, 0}, {-1, 1},
@@ -1336,55 +1337,47 @@ local function UpdateWalkPath(): ()
         end
         return
     end
-
-    if _G.MS_AUTOFLAG and CachedMineCandidateCount > 0 then
-        -- Check if any unflagged mine is close to our path
-        local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
-        if posSuccess and charPos then
-            for i = 1, MathMin(CachedMineCandidateCount, 5) do
-                local candidate: CandidateData = CachedMineCandidates[i]
-                if candidate.distance < 8 then  -- Mine within 8 units
-                    -- Wait for it to be flagged before continuing
-                    if WalkData.active then
-                        HaltMovement()  -- Stop but don't abort path
-                    end
-                    return
-                end
-            end
-        end
-    end
     
     if not HumanoidRootPart or not CheckParentValid(HumanoidRootPart) then
         return
     end
     
     local currentTime: number = OsClock()
+    local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
+    if not posSuccess or not charPos then return end
     
-    -- Throttle path updates
-    if currentTime - WalkData.lastPathUpdate < WALK_PATH_UPDATE_INTERVAL then
-        return
+    -- Check if we need to wait for nearby mines to be flagged
+    if _G.MS_AUTOFLAG and CachedMineCandidateCount > 0 then
+        for i = 1, MathMin(CachedMineCandidateCount, 5) do
+            local candidate: CandidateData = CachedMineCandidates[i]
+            if candidate.distance < 6 then  -- Reduced from 8 to 6
+                -- Pause movement but keep path
+                if WalkData.active then
+                    HaltMovement()
+                end
+                -- Don't return - still check if we need to repath
+                -- but don't move until mine is flagged
+                return
+            end
+        end
     end
     
-    WalkData.lastPathUpdate = currentTime
-    
-    -- Validate BestMove
+    -- Validate BestMove exists and is valid
     if not BestMove or not BestMove.part or not CheckParentValid(BestMove.part) then
         if WalkData.active then
             AbortCurrentWalk()
         end
+        -- Keep trying to find a path periodically
         return
     end
     
-    -- Check if BestMove is still a valid target (unknown tile we can click)
+    -- Check if BestMove is still a valid target
     if BestMove.tileType ~= "unknown" or BestMove.predicted == "mine" then
         if WalkData.active then
             AbortCurrentWalk()
         end
         return
     end
-    
-    local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
-    if not posSuccess or not charPos then return end
     
     -- Check if already near target
     if IsNearTarget(charPos, BestMove) then
@@ -1394,32 +1387,37 @@ local function UpdateWalkPath(): ()
         return
     end
     
-    -- Check if stuck and need to repath
-    local isStuck: boolean = WalkData.active and CheckIfStuck(charPos)
-    
+    -- Determine if we need to find/update path
     local needsRepath: boolean = false
-    local repathReason: string = ""
     
     if not WalkData.active then
-        needsRepath = true
-        repathReason = "not_active"
-    elseif WalkData.targetTile ~= BestMove then
-        needsRepath = true
-        repathReason = "target_changed"
-    elseif not WalkData.path or #WalkData.path == 0 then
-        needsRepath = true
-        repathReason = "no_path"
-    elseif isStuck then
-        -- Only repath if cooldown passed
-        if currentTime - WalkData.lastRepath > WALK_REPATH_COOLDOWN then
+        -- Not walking - try to start if enough time passed
+        if currentTime - LastWalkRetryTime >= WALK_IDLE_RETRY_INTERVAL then
             needsRepath = true
-            repathReason = "stuck"
-            WalkData.stuckTime = 0  -- Reset stuck timer
+            LastWalkRetryTime = currentTime
         end
-    elseif currentTime - WalkData.lastRepath > 5 then
-        -- Periodic repath for long walks
+    elseif WalkData.targetTile ~= BestMove then
+        -- Target changed
         needsRepath = true
-        repathReason = "periodic"
+    elseif not WalkData.path or #WalkData.path == 0 then
+        -- No path
+        needsRepath = true
+    elseif currentTime - WalkData.lastPathUpdate >= WALK_PATH_UPDATE_INTERVAL then
+        -- Time for periodic check
+        WalkData.lastPathUpdate = currentTime
+        
+        -- Check if stuck
+        local isStuck: boolean = CheckIfStuck(charPos)
+        
+        if isStuck then
+            if currentTime - WalkData.lastRepath > WALK_REPATH_COOLDOWN then
+                needsRepath = true
+                WalkData.stuckTime = 0
+            end
+        elseif currentTime - WalkData.lastRepath > 3 then
+            -- Periodic repath every 3 seconds for long walks
+            needsRepath = true
+        end
     end
     
     if needsRepath then
@@ -1430,25 +1428,30 @@ local function UpdateWalkPath(): ()
         if path and #path > 0 then
             WalkData.active = true
             WalkData.path = path
-            -- Start at index 1 if path is short, otherwise skip first node (current position)
             WalkData.pathIndex = (#path > 1) and 2 or 1
             WalkData.targetTile = BestMove
             WalkData.lastRepath = currentTime
+            WalkData.lastPathUpdate = currentTime
             WalkData.lastPosition = charPos
             WalkData.lastPositionTime = currentTime
             WalkData.stuckTime = 0
+            LastWalkRetryTime = currentTime
         else
-            -- No path found
+            -- No path found - abort current walk but will retry
             if WalkData.active then
                 AbortCurrentWalk()
             end
+            LastWalkRetryTime = currentTime
         end
     end
 end
 
-
 local function ExecuteWalkMovement(): ()
-    if not _G.MS_AUTOWALK or not WalkData.active or not WalkData.path then
+    if not _G.MS_AUTOWALK then
+        return
+    end
+    
+    if not WalkData.active or not WalkData.path then
         return
     end
     
@@ -1469,16 +1472,20 @@ local function ExecuteWalkMovement(): ()
         return
     end
     
-    -- Advance through waypoints we've passed
-    local maxAdvance: number = 5  -- Prevent infinite loop
-    local advanced: number = 0
+    -- Check path validity
+    if #WalkData.path == 0 then
+        WalkData.path = nil
+        WalkData.lastRepath = 0
+        return
+    end
     
-    while WalkData.pathIndex <= #WalkData.path and advanced < maxAdvance do
+    -- Advance through waypoints we've passed
+    local advanced: number = 0
+    while WalkData.pathIndex <= #WalkData.path and advanced < 5 do
         local node = WalkData.path[WalkData.pathIndex]
         if not node then break end
         
         local nodeWorld: Vector3 = GridToWorldPosition(node.gx, node.gz)
-        
         local dx: number = nodeWorld.X - charPos.X
         local dz: number = nodeWorld.Z - charPos.Z
         local dist2D: number = MathSqrt(dx * dx + dz * dz)
@@ -1493,8 +1500,6 @@ local function ExecuteWalkMovement(): ()
     
     -- Check if path completed
     if WalkData.pathIndex > #WalkData.path then
-        -- Path completed but might not be at target yet
-        -- Force a repath on next update
         WalkData.path = nil
         WalkData.lastRepath = 0
         return
@@ -1502,60 +1507,43 @@ local function ExecuteWalkMovement(): ()
     
     local targetNode = WalkData.path[WalkData.pathIndex]
     if not targetNode then
-        AbortCurrentWalk()
+        WalkData.path = nil
+        WalkData.lastRepath = 0
         return
     end
     
     local targetWorld: Vector3 = GridToWorldPosition(targetNode.gx, targetNode.gz)
-    
     local dx: number = targetWorld.X - charPos.X
     local dz: number = targetWorld.Z - charPos.Z
     local distToTarget: number = MathSqrt(dx * dx + dz * dz)
     
-    -- Don't move if extremely close (prevents jittering)
     if distToTarget < 0.1 then
         return
     end
     
     local dirX: number, dirZ: number = NormalizeVector2D(dx, dz)
-    
     ApplyMoveDirection(dirX, dirZ)
     
-    -- Improved jump logic
+    -- Jump logic
     local nodesRemaining: number = #WalkData.path - WalkData.pathIndex
-    local currentTime: number = OsClock()
     
-    -- Check if we should attempt a jump
     local shouldTryJump: boolean = false
-    
     if nodesRemaining >= WALK_JUMP_MIN_NODES then
         shouldTryJump = true
     elseif distToTarget >= WALK_JUMP_MIN_DISTANCE then
         shouldTryJump = true
-    end
-    
-    -- Also jump occasionally when moving steadily (humanization)
-    if not shouldTryJump and WalkData.stuckTime == 0 then
-        -- Random jump while walking smoothly
-        if MathRandom() < 0.01 then  -- 1% base chance
-            shouldTryJump = true
-        end
+    elseif WalkData.stuckTime == 0 and MathRandom() < 0.01 then
+        shouldTryJump = true
     end
     
     if shouldTryJump then
-        -- Scale chance based on distance and path length
         local jumpChance: number = WALK_JUMP_BASE_CHANCE
-        
-        -- Increase chance if far from target
         if distToTarget > 8 then
             jumpChance = jumpChance * 1.5
         end
-        
-        -- Increase chance if many nodes remaining
         if nodesRemaining > 5 then
             jumpChance = jumpChance * 1.3
         end
-        
         if MathRandom() < jumpChance then
             TriggerJump()
         end
