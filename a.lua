@@ -1,7 +1,7 @@
 --!native
 --!optimize 2
 
-memory.set_write_strength(0.001) --change this based on your severe mode, this is good for me for high end mode
+memory.set_write_strength(0.002)
 
 ---- environment ----
 local loadSuccess: boolean = pcall(function()
@@ -57,31 +57,69 @@ local ORIGIN_Y: number = 70
 local ORIGIN_Z: number = 0
 
 local LOGIC_INTERVAL: number = 0.01
-local SCAN_INTERVAL: number = 0.6
+local SCAN_INTERVAL: number = 0.5
 local SCAN_TICKS: number = MathMax(1, MathFloor(SCAN_INTERVAL / LOGIC_INTERVAL))
 
-local CLEANUP_INTERVAL: number = 45
+local CLEANUP_INTERVAL: number = 20
 local CLEANUP_POOL_MAX: number = 24
-local STALE_TILE_CHECK_INTERVAL: number = 12
+local STALE_TILE_CHECK_INTERVAL: number = 10
+local DEEP_CLEANUP_INTERVAL: number = 60
+
+local PathOpenSet: {PathNode} = TableCreate(100)
+local PathCameFrom: {[string]: string} = {}
+local PathGScore: {[string]: number} = {}
+local PathFScore: {[string]: number} = {}
+local PathClosedSet: {[string]: boolean} = {}
+
+local MAX_TILES: number = 1000
+local MAX_RENDER_TILES: number = 200
+local MAX_FRONTIER_TILES: number = 300
+local MAX_PENDING_VERIFICATIONS: number = 30
+local MAX_PATH_ITERATIONS: number = 400
+local MAX_PATH_LENGTH: number = 100
+
+local RENDER_SKIP_FRAMES: number = 0
+local AUTOFLAG_SCAN_INTERVAL: number = 0.15
+local AUTOFLAG_MAX_CANDIDATES: number = 20
 
 local AUTOFLAG_TOGGLE_KEY: string = "X"
 local AUTOWALK_TOGGLE_KEY: string = "C"
 local AUTOFLAG_MAX_RANGE: number = 17
-local AUTOFLAG_CLICK_DELAY: number = 0.12
-local AUTOFLAG_VERIFY_DELAY: number = 0.15
-local AUTOFLAG_SMOOTHNESS: number = 0.6
-local AUTOFLAG_CLICK_TOLERANCE: number = 6
+local AUTOFLAG_CLICK_DELAY: number = 0.08
+local AUTOFLAG_VERIFY_DELAY: number = 1.0
+local AUTOFLAG_SMOOTHNESS: number = 0.75
+local AUTOFLAG_CLICK_TOLERANCE: number = 4
+local AUTOFLAG_BATCH_SIZE: number = 3
+
+local LastTargetScreenPos: vector? = nil
+local MouseStableFrames: number = 0
+local IsUnflagging: boolean = false
+local NextTargetQueued: CandidateData? = nil
+
+local CachedMineCandidates: {CandidateData} = TableCreate(AUTOFLAG_MAX_CANDIDATES)
+local CachedWrongFlagCandidates: {CandidateData} = TableCreate(AUTOFLAG_MAX_CANDIDATES)
+local CachedMineCandidateCount: number = 0
+local CachedWrongFlagCandidateCount: number = 0
+local LastAutoFlagScanTime: number = 0
 
 local WALK_ARRIVAL_DIST: number = 1.6
 local WALK_HUMANIZE_VARIANCE: number = 0.08
-local WALK_JUMP_BASE_CHANCE: number = 0.04
-local WALK_JUMP_MIN_DISTANCE: number = 10
-local WALK_JUMP_MIN_NODES: number = 3
+local WALK_JUMP_BASE_CHANCE: number = 0.15
+local WALK_JUMP_MIN_DISTANCE: number = 4
+local WALK_JUMP_MIN_NODES: number = 4
 local WALK_DIRECTION_SMOOTHING: number = 0.82
 local WALK_PATH_UPDATE_INTERVAL: number = 0.18
 local WALK_JUMP_COOLDOWN_MIN: number = 0.4
 local WALK_JUMP_COOLDOWN_MAX: number = 0.7
 local WALK_DIRECTION_CHANGE_THRESHOLD: number = 0.3
+local WALK_STUCK_CHECK_INTERVAL: number = 0.5
+local WALK_STUCK_DISTANCE_THRESHOLD: number = 0.3
+local WALK_MAX_STUCK_TIME: number = 2.0
+local WALK_REPATH_COOLDOWN: number = 0.5
+local WALK_TARGET_REACHED_DIST: number = 3.0
+local WALK_MAX_RISKY_PROBABILITY: number = 0.20  
+local WALK_RISKY_TILE_COST: number = 50 
+
 
 local NEIGHBOR_OFFSETS: {{number}} = {
     {-1, -1}, {-1, 0}, {-1, 1},
@@ -234,12 +272,18 @@ local WasAutoWalkKeyPressed: boolean = false
 
 local LastCleanupTime: number = 0
 local LastStaleCheckTime: number = 0
+local LastDeepCleanupTime: number = 0
 
 local MS: Instance? = nil
 local FLAG: Instance? = nil
 
-local RenderData: {TileData} = TableCreate(625)
+local RenderData: {TileData} = TableCreate(200)
 local RenderCount: number = 0
+local RenderFrameSkip: number = 0
+
+local CachedScreenPositions: {[TileData]: vector} = {}
+local LastScreenCacheTime: number = 0
+local SCREEN_CACHE_INTERVAL: number = 0.016
 
 local FrontierTiles: {TileData} = TableCreate(200)
 local FrontierCount: number = 0
@@ -259,7 +303,11 @@ local WalkData: WalkState = {
     nextJumpCooldown = 0.3,
     currentDirection = VectorCreate(0, 0, 0),
     lastDirection = VectorCreate(0, 0, 0),
-    abortToken = 0
+    abortToken = 0,
+    lastPosition = nil,
+    lastPositionTime = 0,
+    stuckTime = 0,
+    lastSuccessfulMove = 0
 }
 
 ---- memory management functions ----
@@ -332,6 +380,56 @@ local function ReturnPathNode(node: PathNode): ()
     end
 end
 
+local function TrimPool(pool: {any}, maxSize: number): ()
+    local count: number = #pool
+    while count > maxSize do
+        pool[count] = nil
+        count = count - 1
+    end
+end
+
+local function UnregisterTile(index: number): ()
+    local t: TileData = Tiles[index]
+    if t and t.gx and t.gz then
+        Grid[t.gx .. "|" .. t.gz] = nil
+    end
+    
+    Tiles[index] = Tiles[TileCount]
+    Tiles[TileCount] = nil
+    TileCount = TileCount - 1
+end
+
+local function HaltMovement(): ()
+    if not Humanoid then return end
+    
+    Pcall(function()
+        Humanoid.MoveDirection = Vector3.new(0, 0, 0)
+    end)
+    
+    WalkData.currentDirection = VectorCreate(0, 0, 0)
+end
+
+local function AbortCurrentWalk(): ()
+    WalkData.active = false
+    if WalkData.path then
+        for i = #WalkData.path, 1, -1 do
+            WalkData.path[i] = nil
+        end
+    end
+    WalkData.path = nil
+    WalkData.pathIndex = 1
+    WalkData.targetTile = nil
+    WalkData.abortToken = WalkData.abortToken + 1
+    WalkData.lastDirection = VectorCreate(0, 0, 0)
+    WalkData.currentDirection = VectorCreate(0, 0, 0)
+    WalkData.lastRepath = 0
+    WalkData.lastPathUpdate = 0
+    WalkData.lastPosition = nil
+    WalkData.stuckTime = 0
+    HaltMovement()
+end
+
+
 local function PerformMemoryCleanup(): ()
     local currentTime: number = OsClock()
     
@@ -341,28 +439,158 @@ local function PerformMemoryCleanup(): ()
     
     LastCleanupTime = currentTime
     
-    while #TablePool > CLEANUP_POOL_MAX do
-        TablePool[#TablePool] = nil
+    TrimPool(TablePool, CLEANUP_POOL_MAX)
+    TrimPool(QueuePool, CLEANUP_POOL_MAX)
+    TrimPool(InQueuePool, CLEANUP_POOL_MAX)
+    TrimPool(PathNodePool, CLEANUP_POOL_MAX * 2)
+    
+    local pendingCount: number = #PendingVerifications
+    if pendingCount > MAX_PENDING_VERIFICATIONS then
+        for i = pendingCount, MAX_PENDING_VERIFICATIONS + 1, -1 do
+            PendingVerifications[i] = nil
+        end
+        pendingCount = MAX_PENDING_VERIFICATIONS
     end
     
-    while #QueuePool > CLEANUP_POOL_MAX do
-        QueuePool[#QueuePool] = nil
-    end
-    
-    while #InQueuePool > CLEANUP_POOL_MAX do
-        InQueuePool[#InQueuePool] = nil
-    end
-    
-    while #PathNodePool > CLEANUP_POOL_MAX * 2 do
-        PathNodePool[#PathNodePool] = nil
-    end
-    
-    for i = #PendingVerifications, 1, -1 do
-        local entry: AutoFlagEntry = PendingVerifications[i]
-        if currentTime - entry.time > 5 then
-            TableRemove(PendingVerifications, i)
+    for i = pendingCount, 1, -1 do
+        local entry: AutoFlagEntry? = PendingVerifications[i]
+        if entry and currentTime - entry.time > 3 then
+            PendingVerifications[i] = PendingVerifications[pendingCount]
+            PendingVerifications[pendingCount] = nil
+            pendingCount = pendingCount - 1
         end
     end
+    
+    if TileCount > 0 then
+        local maxCheck: number = MathMin(TileCount, 15)
+        for _ = 1, maxCheck do
+            if TileCount <= 0 then break end
+            local idx: number = MathRandom(1, TileCount)
+            local t: TileData? = Tiles[idx]
+            if t and t.part and not CheckParentValid(t.part) then
+                UnregisterTile(idx)
+                SolverChanged = true
+            end
+        end
+    end
+    
+    if TileCount > MAX_TILES then
+        for i = TileCount, MAX_TILES + 1, -1 do
+            UnregisterTile(i)
+        end
+        SolverChanged = true
+    end
+end
+
+local function PerformDeepCleanup(): ()
+    local currentTime: number = OsClock()
+    
+    if currentTime - LastDeepCleanupTime < DEEP_CLEANUP_INTERVAL then
+        return
+    end
+    
+    LastDeepCleanupTime = currentTime
+    
+    TrimPool(TablePool, CLEANUP_POOL_MAX / 2)
+    TrimPool(QueuePool, CLEANUP_POOL_MAX / 2)
+    TrimPool(InQueuePool, CLEANUP_POOL_MAX / 2)
+    TrimPool(PathNodePool, CLEANUP_POOL_MAX)
+    
+    if not _G.MS_AUTOWALK and not WalkData.active then
+        for i = #PathNodePool, 1, -1 do
+            PathNodePool[i] = nil
+        end
+        TableClear(PathCameFrom)
+        TableClear(PathGScore)
+        TableClear(PathFScore)
+        TableClear(PathClosedSet)
+        for i = #PathOpenSet, 1, -1 do
+            PathOpenSet[i] = nil
+        end
+    end
+    
+    if not _G.MS_AUTOFLAG then
+        for i = #PendingVerifications, 1, -1 do
+            PendingVerifications[i] = nil
+        end
+        LockedTarget = nil
+        NextTargetQueued = nil
+        LastTargetScreenPos = nil
+        MouseStableFrames = 0
+        IsUnflagging = false
+    end
+    
+    LastTankSystem = nil
+    
+    for i = RenderCount + 1, #RenderData do
+        RenderData[i] = nil
+    end
+    
+    for i = FrontierCount + 1, #FrontierTiles do
+        FrontierTiles[i] = nil
+    end
+    
+    collectgarbage("step", 100)
+end
+
+local function ResetAllState(): ()
+    for i = TileCount, 1, -1 do
+        Tiles[i] = nil
+    end
+    TileCount = 0
+    TableClear(Grid)
+    
+    RenderCount = 0
+    for i = 1, #RenderData do
+        RenderData[i] = nil
+    end
+    
+    FrontierCount = 0
+    for i = 1, #FrontierTiles do
+        FrontierTiles[i] = nil
+    end
+    
+    for i = 1, #PendingVerifications do
+        PendingVerifications[i] = nil
+    end
+    
+    LockedTarget = nil
+    NextTargetQueued = nil
+    LastTargetScreenPos = nil
+    MouseStableFrames = 0
+    IsUnflagging = false
+    
+    AbortCurrentWalk()
+    
+    for i = #TablePool, 1, -1 do
+        TablePool[i] = nil
+    end
+    for i = #QueuePool, 1, -1 do
+        QueuePool[i] = nil
+    end
+    for i = #InQueuePool, 1, -1 do
+        InQueuePool[i] = nil
+    end
+    for i = #PathNodePool, 1, -1 do
+        PathNodePool[i] = nil
+    end
+    
+    TableClear(PathCameFrom)
+    TableClear(PathGScore)
+    TableClear(PathFScore)
+    TableClear(PathClosedSet)
+    for i = #PathOpenSet, 1, -1 do
+        PathOpenSet[i] = nil
+    end
+    
+    BestMove = nil
+    BestMoveRisk = 1
+    LastTankSystem = nil
+    SolverChanged = true
+    LastChildCount = 0
+    TickCount = 0
+    
+    collectgarbage("collect")
 end
 
 local function ValidateStaleTiles(): ()
@@ -654,6 +882,8 @@ end
 local function RegisterTile(part: BasePart): ()
     if not CheckParentValid(part) then return end
     
+    if TileCount >= MAX_TILES then return end
+    
     local key: string?, gx: number?, gz: number? = PositionToGridKey(part)
     if not key or not gx or not gz then return end
     
@@ -685,39 +915,103 @@ local function RegisterTile(part: BasePart): ()
     Grid[key] = t
 end
 
-local function UnregisterTile(index: number): ()
-    local t: TileData = Tiles[index]
-    if t and t.gx and t.gz then
-        Grid[t.gx .. "|" .. t.gz] = nil
-    end
-    
-    Tiles[index] = Tiles[TileCount]
-    Tiles[TileCount] = nil
-    TileCount = TileCount - 1
-end
-
 ---- pathfinding functions ----
 
-local function IsTileTraversable(tile: TileData?): boolean
+local function IsTileSafeToWalk(tile: TileData?): boolean
+    -- Returns true only for completely safe tiles
     if not tile then return false end
     
+    -- Never walk on confirmed/revealed mines
     if tile.tileType == "mine" then return false end
-    if tile.predicted == "mine" and not tile.flagged then return false end
     
+    -- Safe to walk on revealed tiles
     if tile.tileType == "number" or tile.tileType == "empty" then
         return true
     end
     
-    if tile.predicted == "safe" then
-        return true
-    end
-    
-    if tile.flagged then
-        return true
+    -- For unknown tiles
+    if tile.tileType == "unknown" then
+        -- Flagged mines are safe to walk over (we marked them, can't click them)
+        if tile.flagged then
+            return true
+        end
+        
+        -- Predicted mines - never walk on them
+        if tile.predicted == "mine" then
+            return false
+        end
+        
+        -- Predicted safe - safe to walk
+        if tile.predicted == "safe" then
+            return true
+        end
+        
+        -- Has probability - NOT safe (we want to avoid these in primary path)
+        if tile.probability ~= nil then
+            return false  -- Any percentage tile is not "safe"
+        end
+        
+        -- Unknown with no data on frontier - not safe
+        if tile.hasRevealedNeighbor then
+            return false
+        end
+        
+        -- Far from frontier with low density - marginally safe
+        return DENSITY <= 0.15
     end
     
     return false
 end
+
+local function IsTileRiskyButAllowed(tile: TileData?): boolean
+    -- Returns true for tiles that are risky but acceptable as last resort (≤20%)
+    if not tile then return false end
+    
+    -- First check if it's already safe
+    if IsTileSafeToWalk(tile) then return true end
+    
+    -- Never walk on mines
+    if tile.tileType == "mine" then return false end
+    if tile.predicted == "mine" then return false end
+    
+    -- For unknown tiles with probability
+    if tile.tileType == "unknown" then
+        if tile.probability ~= nil then
+            return tile.probability <= WALK_MAX_RISKY_PROBABILITY
+        end
+        
+        -- Unknown frontier tile with no probability - use density
+        if tile.hasRevealedNeighbor then
+            return DENSITY <= WALK_MAX_RISKY_PROBABILITY
+        end
+        
+        return DENSITY <= WALK_MAX_RISKY_PROBABILITY
+    end
+    
+    return false
+end
+
+local function GetTileTraversalCost(tile: TileData?, allowRisky: boolean): number?
+    -- Returns nil if not traversable, or a cost value
+    -- Lower cost = preferred path
+    if not tile then return nil end
+    
+    -- Check if safe first
+    if IsTileSafeToWalk(tile) then
+        return 1  -- Base cost for safe tiles
+    end
+    
+    -- If we're allowing risky tiles and this one qualifies
+    if allowRisky and IsTileRiskyButAllowed(tile) then
+        -- Add heavy penalty based on probability
+        local prob: number = tile.probability or DENSITY
+        -- Cost scales with risk: 20% = cost of 50, 10% = cost of 25, etc.
+        return 1 + WALK_RISKY_TILE_COST * (prob / WALK_MAX_RISKY_PROBABILITY)
+    end
+    
+    return nil  -- Not traversable
+end
+
 
 local function IsTileClickable(tile: TileData?): boolean
     if not tile then return false end
@@ -728,7 +1022,7 @@ local function IsTileClickable(tile: TileData?): boolean
     return true
 end
 
-local function ComputeGridPath(startGx: number, startGz: number, goalGx: number, goalGz: number): {{gx: number, gz: number}}?
+local function ComputeGridPath(startGx: number, startGz: number, goalGx: number, goalGz: number, allowRisky: boolean): {{gx: number, gz: number}}?
     local startKey: string = startGx .. "|" .. startGz
     local goalKey: string = goalGx .. "|" .. goalGz
     
@@ -736,11 +1030,21 @@ local function ComputeGridPath(startGx: number, startGz: number, goalGx: number,
         return {{ gx = startGx, gz = startGz }}
     end
     
-    local openSet: {PathNode} = TableCreate(100)
-    local cameFrom: {[string]: string} = {}
-    local gScore: {[string]: number} = {}
-    local fScore: {[string]: number} = {}
-    local closedSet: {[string]: boolean} = {}
+    TableClear(PathCameFrom)
+    TableClear(PathGScore)
+    TableClear(PathFScore)
+    TableClear(PathClosedSet)
+    
+    for i = 1, #PathOpenSet do
+        ReturnPathNode(PathOpenSet[i])
+    end
+    TableClear(PathOpenSet)
+    
+    local openSet: {PathNode} = PathOpenSet
+    local cameFrom: {[string]: string} = PathCameFrom
+    local gScore: {[string]: number} = PathGScore
+    local fScore: {[string]: number} = PathFScore
+    local closedSet: {[string]: boolean} = PathClosedSet
     
     gScore[startKey] = 0
     fScore[startKey] = ComputeManhattanDist(startGx, startGz, goalGx, goalGz)
@@ -753,9 +1057,8 @@ local function ComputeGridPath(startGx: number, startGz: number, goalGx: number,
     openSet[1] = startNode
     
     local iterations: number = 0
-    local maxIterations: number = 500
     
-    while #openSet > 0 and iterations < maxIterations do
+    while #openSet > 0 and iterations < MAX_PATH_ITERATIONS do
         iterations = iterations + 1
         
         TableSort(openSet, function(a: PathNode, b: PathNode): boolean
@@ -768,11 +1071,13 @@ local function ComputeGridPath(startGx: number, startGz: number, goalGx: number,
         if currentKey == goalKey then
             local path: {{gx: number, gz: number}} = TableCreate(50)
             local curr: string? = currentKey
+            local pathLen: number = 0
             
-            while curr do
+            while curr and pathLen < MAX_PATH_LENGTH do
                 local gxStr, gzStr = curr:match("^(%-?%d+)|(%-?%d+)$")
                 if gxStr and gzStr then
                     TableInsert(path, 1, { gx = tonumber(gxStr), gz = tonumber(gzStr) })
+                    pathLen = pathLen + 1
                 end
                 curr = cameFrom[curr]
             end
@@ -796,15 +1101,19 @@ local function ComputeGridPath(startGx: number, startGz: number, goalGx: number,
             if not closedSet[nKey] then
                 local neighborTile: TileData? = Grid[nKey]
                 
-                local canTraverse: boolean = false
+                local moveCost: number? = nil
+                
+                -- Special handling for goal tile
                 if nKey == goalKey then
-                    canTraverse = neighborTile ~= nil and neighborTile.predicted ~= "mine" and neighborTile.tileType ~= "mine"
+                    if neighborTile and neighborTile.predicted ~= "mine" and neighborTile.tileType ~= "mine" then
+                        moveCost = 1
+                    end
                 else
-                    canTraverse = IsTileTraversable(neighborTile)
+                    moveCost = GetTileTraversalCost(neighborTile, allowRisky)
                 end
                 
-                if canTraverse then
-                    local tentativeG: number = (gScore[currentKey] or MathHuge) + 1
+                if moveCost then
+                    local tentativeG: number = (gScore[currentKey] or MathHuge) + moveCost
                     local currentG: number = gScore[nKey] or MathHuge
                     
                     if tentativeG < currentG then
@@ -853,14 +1162,20 @@ local function FindApproachPath(startGx: number, startGz: number, targetTile: Ti
     local goalGx: number = targetTile.gx
     local goalGz: number = targetTile.gz
     
-    if IsTileTraversable(targetTile) then
-        local path = ComputeGridPath(startGx, startGz, goalGx, goalGz)
-        return path, targetTile
+    -- First, try to find a completely safe path
+    local safePath: {{gx: number, gz: number}}? = nil
+    
+    if IsTileSafeToWalk(targetTile) then
+        safePath = ComputeGridPath(startGx, startGz, goalGx, goalGz, false)
+        if safePath then
+            return safePath, targetTile
+        end
     end
     
-    local bestPath: {{gx: number, gz: number}}? = nil
-    local bestApproach: TileData? = nil
-    local bestLen: number = MathHuge
+    -- Try approaching from adjacent safe tiles
+    local bestSafePath: {{gx: number, gz: number}}? = nil
+    local bestSafeApproach: TileData? = nil
+    local bestSafeLen: number = MathHuge
     
     for i = 1, 4 do
         local offset: {number} = CARDINAL_OFFSETS[i]
@@ -869,29 +1184,94 @@ local function FindApproachPath(startGx: number, startGz: number, targetTile: Ti
         local aKey: string = ax .. "|" .. az
         local approachTile: TileData? = Grid[aKey]
         
-        if approachTile and IsTileTraversable(approachTile) then
-            local path = ComputeGridPath(startGx, startGz, ax, az)
-            if path and #path < bestLen then
-                bestLen = #path
-                bestPath = path
-                bestApproach = approachTile
+        if approachTile and IsTileSafeToWalk(approachTile) then
+            local path = ComputeGridPath(startGx, startGz, ax, az, false)
+            if path and #path < bestSafeLen then
+                bestSafeLen = #path
+                bestSafePath = path
+                bestSafeApproach = approachTile
             end
         end
     end
     
-    return bestPath, bestApproach
+    if bestSafePath then
+        return bestSafePath, bestSafeApproach
+    end
+    
+    -- No safe path found - try with risky tiles allowed (≤20%)
+    local riskyPath: {{gx: number, gz: number}}? = nil
+    
+    if IsTileRiskyButAllowed(targetTile) then
+        riskyPath = ComputeGridPath(startGx, startGz, goalGx, goalGz, true)
+        if riskyPath then
+            return riskyPath, targetTile
+        end
+    end
+    
+    -- Try approaching from adjacent tiles (including risky ones)
+    local bestRiskyPath: {{gx: number, gz: number}}? = nil
+    local bestRiskyApproach: TileData? = nil
+    local bestRiskyLen: number = MathHuge
+    
+    for i = 1, 4 do
+        local offset: {number} = CARDINAL_OFFSETS[i]
+        local ax: number = goalGx + offset[1]
+        local az: number = goalGz + offset[2]
+        local aKey: string = ax .. "|" .. az
+        local approachTile: TileData? = Grid[aKey]
+        
+        if approachTile and IsTileRiskyButAllowed(approachTile) then
+            local path = ComputeGridPath(startGx, startGz, ax, az, true)
+            if path and #path < bestRiskyLen then
+                bestRiskyLen = #path
+                bestRiskyPath = path
+                bestRiskyApproach = approachTile
+            end
+        end
+    end
+    
+    return bestRiskyPath, bestRiskyApproach
 end
+
 
 ---- movement functions ----
 
-local function HaltMovement(): ()
-    if not Humanoid then return end
+local function IsNearTarget(charPos: Vector3, targetTile: TileData): boolean
+    if not targetTile or not targetTile.storedPos then return false end
+    local targetPos: Vector3 = targetTile.storedPos
+    local dx: number = targetPos.X - charPos.X
+    local dz: number = targetPos.Z - charPos.Z
+    local dist: number = MathSqrt(dx * dx + dz * dz)
+    return dist < WALK_TARGET_REACHED_DIST
+end
+
+local function CheckIfStuck(charPos: Vector3): boolean
+    local currentTime: number = OsClock()
     
-    Pcall(function()
-        Humanoid.MoveDirection = Vector3.new(0, 0, 0)
-    end)
+    if not WalkData.lastPosition then
+        WalkData.lastPosition = charPos
+        WalkData.lastPositionTime = currentTime
+        WalkData.stuckTime = 0
+        return false
+    end
     
-    WalkData.currentDirection = VectorCreate(0, 0, 0)
+    if currentTime - WalkData.lastPositionTime >= WALK_STUCK_CHECK_INTERVAL then
+        local dx: number = charPos.X - WalkData.lastPosition.X
+        local dz: number = charPos.Z - WalkData.lastPosition.Z
+        local movedDist: number = MathSqrt(dx * dx + dz * dz)
+        
+        if movedDist < WALK_STUCK_DISTANCE_THRESHOLD then
+            WalkData.stuckTime = WalkData.stuckTime + (currentTime - WalkData.lastPositionTime)
+        else
+            WalkData.stuckTime = 0
+            WalkData.lastSuccessfulMove = currentTime
+        end
+        
+        WalkData.lastPosition = charPos
+        WalkData.lastPositionTime = currentTime
+    end
+    
+    return WalkData.stuckTime >= WALK_MAX_STUCK_TIME
 end
 
 local function ApplyMoveDirection(dirX: number, dirZ: number): boolean
@@ -949,22 +1329,29 @@ local function TriggerJump(): boolean
     return success
 end
 
-local function AbortCurrentWalk(): ()
-    WalkData.active = false
-    WalkData.path = nil
-    WalkData.pathIndex = 1
-    WalkData.targetTile = nil
-    WalkData.abortToken = WalkData.abortToken + 1
-    WalkData.lastDirection = VectorCreate(0, 0, 0)
-    HaltMovement()
-end
-
 local function UpdateWalkPath(): ()
     if not _G.MS_AUTOWALK then
         if WalkData.active then
             AbortCurrentWalk()
         end
         return
+    end
+
+    if _G.MS_AUTOFLAG and CachedMineCandidateCount > 0 then
+        -- Check if any unflagged mine is close to our path
+        local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
+        if posSuccess and charPos then
+            for i = 1, MathMin(CachedMineCandidateCount, 5) do
+                local candidate: CandidateData = CachedMineCandidates[i]
+                if candidate.distance < 8 then  -- Mine within 8 units
+                    -- Wait for it to be flagged before continuing
+                    if WalkData.active then
+                        HaltMovement()  -- Stop but don't abort path
+                    end
+                    return
+                end
+            end
+        end
     end
     
     if not HumanoidRootPart or not CheckParentValid(HumanoidRootPart) then
@@ -973,12 +1360,14 @@ local function UpdateWalkPath(): ()
     
     local currentTime: number = OsClock()
     
+    -- Throttle path updates
     if currentTime - WalkData.lastPathUpdate < WALK_PATH_UPDATE_INTERVAL then
         return
     end
     
     WalkData.lastPathUpdate = currentTime
     
+    -- Validate BestMove
     if not BestMove or not BestMove.part or not CheckParentValid(BestMove.part) then
         if WalkData.active then
             AbortCurrentWalk()
@@ -986,22 +1375,54 @@ local function UpdateWalkPath(): ()
         return
     end
     
+    -- Check if BestMove is still a valid target (unknown tile we can click)
+    if BestMove.tileType ~= "unknown" or BestMove.predicted == "mine" then
+        if WalkData.active then
+            AbortCurrentWalk()
+        end
+        return
+    end
+    
+    local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
+    if not posSuccess or not charPos then return end
+    
+    -- Check if already near target
+    if IsNearTarget(charPos, BestMove) then
+        if WalkData.active then
+            AbortCurrentWalk()
+        end
+        return
+    end
+    
+    -- Check if stuck and need to repath
+    local isStuck: boolean = WalkData.active and CheckIfStuck(charPos)
+    
     local needsRepath: boolean = false
+    local repathReason: string = ""
     
     if not WalkData.active then
         needsRepath = true
+        repathReason = "not_active"
     elseif WalkData.targetTile ~= BestMove then
         needsRepath = true
+        repathReason = "target_changed"
     elseif not WalkData.path or #WalkData.path == 0 then
         needsRepath = true
-    elseif currentTime - WalkData.lastRepath > 4 then
+        repathReason = "no_path"
+    elseif isStuck then
+        -- Only repath if cooldown passed
+        if currentTime - WalkData.lastRepath > WALK_REPATH_COOLDOWN then
+            needsRepath = true
+            repathReason = "stuck"
+            WalkData.stuckTime = 0  -- Reset stuck timer
+        end
+    elseif currentTime - WalkData.lastRepath > 5 then
+        -- Periodic repath for long walks
         needsRepath = true
+        repathReason = "periodic"
     end
     
     if needsRepath then
-        local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
-        if not posSuccess or not charPos then return end
-        
         local startGx: number, startGz: number = WorldToGridCoords(charPos)
         
         local path, approach = FindApproachPath(startGx, startGz, BestMove)
@@ -1009,16 +1430,22 @@ local function UpdateWalkPath(): ()
         if path and #path > 0 then
             WalkData.active = true
             WalkData.path = path
-            WalkData.pathIndex = 2
+            -- Start at index 1 if path is short, otherwise skip first node (current position)
+            WalkData.pathIndex = (#path > 1) and 2 or 1
             WalkData.targetTile = BestMove
             WalkData.lastRepath = currentTime
+            WalkData.lastPosition = charPos
+            WalkData.lastPositionTime = currentTime
+            WalkData.stuckTime = 0
         else
+            -- No path found
             if WalkData.active then
                 AbortCurrentWalk()
             end
         end
     end
 end
+
 
 local function ExecuteWalkMovement(): ()
     if not _G.MS_AUTOWALK or not WalkData.active or not WalkData.path then
@@ -1036,8 +1463,20 @@ local function ExecuteWalkMovement(): ()
     local posSuccess: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
     if not posSuccess or not charPos then return end
     
-    while WalkData.pathIndex <= #WalkData.path do
+    -- Check if we've reached the target tile area
+    if WalkData.targetTile and IsNearTarget(charPos, WalkData.targetTile) then
+        AbortCurrentWalk()
+        return
+    end
+    
+    -- Advance through waypoints we've passed
+    local maxAdvance: number = 5  -- Prevent infinite loop
+    local advanced: number = 0
+    
+    while WalkData.pathIndex <= #WalkData.path and advanced < maxAdvance do
         local node = WalkData.path[WalkData.pathIndex]
+        if not node then break end
+        
         local nodeWorld: Vector3 = GridToWorldPosition(node.gx, node.gz)
         
         local dx: number = nodeWorld.X - charPos.X
@@ -1046,31 +1485,78 @@ local function ExecuteWalkMovement(): ()
         
         if dist2D < WALK_ARRIVAL_DIST then
             WalkData.pathIndex = WalkData.pathIndex + 1
+            advanced = advanced + 1
         else
             break
         end
     end
     
+    -- Check if path completed
     if WalkData.pathIndex > #WalkData.path then
-        AbortCurrentWalk()
+        -- Path completed but might not be at target yet
+        -- Force a repath on next update
+        WalkData.path = nil
+        WalkData.lastRepath = 0
         return
     end
     
     local targetNode = WalkData.path[WalkData.pathIndex]
+    if not targetNode then
+        AbortCurrentWalk()
+        return
+    end
+    
     local targetWorld: Vector3 = GridToWorldPosition(targetNode.gx, targetNode.gz)
     
     local dx: number = targetWorld.X - charPos.X
     local dz: number = targetWorld.Z - charPos.Z
     local distToTarget: number = MathSqrt(dx * dx + dz * dz)
     
+    -- Don't move if extremely close (prevents jittering)
+    if distToTarget < 0.1 then
+        return
+    end
+    
     local dirX: number, dirZ: number = NormalizeVector2D(dx, dz)
     
     ApplyMoveDirection(dirX, dirZ)
     
+    -- Improved jump logic
     local nodesRemaining: number = #WalkData.path - WalkData.pathIndex
+    local currentTime: number = OsClock()
     
-    if nodesRemaining >= WALK_JUMP_MIN_NODES and distToTarget >= WALK_JUMP_MIN_DISTANCE then
-        if MathRandom() < WALK_JUMP_BASE_CHANCE then
+    -- Check if we should attempt a jump
+    local shouldTryJump: boolean = false
+    
+    if nodesRemaining >= WALK_JUMP_MIN_NODES then
+        shouldTryJump = true
+    elseif distToTarget >= WALK_JUMP_MIN_DISTANCE then
+        shouldTryJump = true
+    end
+    
+    -- Also jump occasionally when moving steadily (humanization)
+    if not shouldTryJump and WalkData.stuckTime == 0 then
+        -- Random jump while walking smoothly
+        if MathRandom() < 0.01 then  -- 1% base chance
+            shouldTryJump = true
+        end
+    end
+    
+    if shouldTryJump then
+        -- Scale chance based on distance and path length
+        local jumpChance: number = WALK_JUMP_BASE_CHANCE
+        
+        -- Increase chance if far from target
+        if distToTarget > 8 then
+            jumpChance = jumpChance * 1.5
+        end
+        
+        -- Increase chance if many nodes remaining
+        if nodesRemaining > 5 then
+            jumpChance = jumpChance * 1.3
+        end
+        
+        if MathRandom() < jumpChance then
             TriggerJump()
         end
     end
@@ -1382,7 +1868,11 @@ local function BuildFrontier(): ()
     FrontierCount = 0
     
     for i = 1, TileCount do
-        local t: TileData = Tiles[i]
+        if FrontierCount >= MAX_FRONTIER_TILES then break end
+        
+        local t: TileData? = Tiles[i]
+        if not t then continue end
+        
         t.hasRevealedNeighbor = nil
         t.constraintCount = 0
         
@@ -1486,6 +1976,85 @@ local function EstimateNeighborMineCountDist(tile: TileData): {number}
     return out
 end
 
+local function CountUnknownNeighbors(tile: TileData): number
+    local count: number = 0
+    local neighbors: {TileData} = FetchNeighbors(tile)
+    for i = 1, #neighbors do
+        local n: TileData = neighbors[i]
+        if n.tileType == "unknown" and n.predicted ~= "mine" and n.predicted ~= "safe" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function CountRevealedNeighbors(tile: TileData): number
+    local count: number = 0
+    local neighbors: {TileData} = FetchNeighbors(tile)
+    for i = 1, #neighbors do
+        local n: TileData = neighbors[i]
+        if n.tileType == "number" or n.tileType == "empty" then
+            count = count + 1
+        end
+    end
+    return count
+end
+
+local function IsCornerTile(tile: TileData): boolean
+    local revealed: number = CountRevealedNeighbors(tile)
+    local unknown: number = CountUnknownNeighbors(tile)
+    return revealed <= 2 and unknown >= 3
+end
+
+local function IsEdgeTile(tile: TileData): boolean
+    local revealed: number = CountRevealedNeighbors(tile)
+    return revealed >= 1 and revealed <= 3
+end
+
+local function ComputeTileScore(tile: TileData, risk: number): number
+    local score: number = 0
+    
+    local safeProb: number = 1 - risk
+    score = score + safeProb * 100
+    
+    local neighbors: {TileData} = FetchNeighborsCopy(tile)
+    local unknownNeighbors: number = 0
+    local revealedNeighbors: number = 0
+    local constraintSum: number = 0
+    
+    for i = 1, #neighbors do
+        local n: TileData = neighbors[i]
+        if n.tileType == "unknown" and n.predicted ~= "mine" then
+            unknownNeighbors = unknownNeighbors + 1
+        elseif n.tileType == "number" then
+            revealedNeighbors = revealedNeighbors + 1
+            constraintSum = constraintSum + (n.constraintCount or 0)
+        elseif n.tileType == "empty" then
+            revealedNeighbors = revealedNeighbors + 1
+        end
+    end
+    
+    score = score + unknownNeighbors * 5
+    
+    score = score + revealedNeighbors * 3
+    
+    if tile.constraintCount and tile.constraintCount > 0 then
+        score = score + tile.constraintCount * 8
+    end
+    
+    if IsCornerTile(tile) then
+        score = score - 15
+    end
+    
+    if USE_ENTROPY_TIEBREAK then
+        local dist: {number} = EstimateNeighborMineCountDist(tile)
+        local entropy: number = Entropy(dist)
+        score = score + entropy * 10
+    end
+    
+    return score
+end
+
 local function PickBestMove(): (TileData?, number)
     local bestRisk: number = 2
     local candidates: {TileData} = TableCreate(100)
@@ -1513,61 +2082,61 @@ local function PickBestMove(): (TileData?, number)
         return nil, 1
     end
     
-    local refPos: Vector3? = GetRefPosition()
-    
-    if candidateCount > 1 and refPos then
-        TableSort(candidates, function(a: TileData, b: TileData): boolean
-            local posA: Vector3? = a.storedPos
-            local posB: Vector3? = b.storedPos
-            
-            if not posA then return false end
-            if not posB then return true end
-            
-            local diffA: Vector3 = posA - refPos
-            local diffB: Vector3 = posB - refPos
-            local distA: number = VectorMagnitude(VectorCreate(diffA.X, diffA.Y, diffA.Z))
-            local distB: number = VectorMagnitude(VectorCreate(diffB.X, diffB.Y, diffB.Z))
-            
-            return distA < distB
-        end)
-    end
-    
     if bestRisk == 0 then
+        local refPos: Vector3? = GetRefPosition()
+        if candidateCount > 1 and refPos then
+            TableSort(candidates, function(a: TileData, b: TileData): boolean
+                local posA: Vector3? = a.storedPos
+                local posB: Vector3? = b.storedPos
+                if not posA then return false end
+                if not posB then return true end
+                local diffA: Vector3 = posA - refPos
+                local diffB: Vector3 = posB - refPos
+                local distA: number = VectorMagnitude(VectorCreate(diffA.X, diffA.Y, diffA.Z))
+                local distB: number = VectorMagnitude(VectorCreate(diffB.X, diffB.Y, diffB.Z))
+                return distA < distB
+            end)
+        end
         return candidates[1], 0
     end
     
     local bestTile: TileData = candidates[1]
-    local bestScore: number = -1
-    local maxC: number = MathMin(candidateCount, MAX_LOOKAHEAD_CANDIDATES)
+    local bestScore: number = -MathHuge
     
-    for i = 1, maxC do
+    local maxEval: number = MathMin(candidateCount, 20)
+    
+    for i = 1, maxEval do
         local t: TileData = candidates[i]
-        local s: number? = nil
+        local r: number = t.probability or FALLBACK_RISK
+        local score: number = ComputeTileScore(t, r)
         
-        if USE_ENTROPY_TIEBREAK then
-            local dist: {number} = EstimateNeighborMineCountDist(t)
-            local risk: number = t.probability or FALLBACK_RISK
-            s = (1 - risk) * Entropy(dist)
-        end
-        
-        if not s then
-            local open: number = 0
-            local neighbors: {TileData} = FetchNeighborsCopy(t)
-            
-            for j = 1, #neighbors do
-                local n: TileData = neighbors[j]
-                if n.tileType == "unknown" and n.predicted ~= "mine" then
-                    open = open + 1
-                end
-            end
-            
-            s = open * 0.01
-        end
-        
-        if s > bestScore then
-            bestScore = s
+        if score > bestScore then
+            bestScore = score
             bestTile = t
         end
+    end
+    
+    local refPos: Vector3? = GetRefPosition()
+    if refPos and bestTile.storedPos then
+        local bestDist: number = MathHuge
+        local bestDistTile: TileData = bestTile
+        
+        for i = 1, maxEval do
+            local t: TileData = candidates[i]
+            local r: number = t.probability or FALLBACK_RISK
+            local score: number = ComputeTileScore(t, r)
+            
+            if MathAbs(score - bestScore) < 5 and t.storedPos then
+                local diff: Vector3 = t.storedPos - refPos
+                local dist: number = VectorMagnitude(VectorCreate(diff.X, diff.Y, diff.Z))
+                if dist < bestDist then
+                    bestDist = dist
+                    bestDistTile = t
+                end
+            end
+        end
+        
+        bestTile = bestDistTile
     end
     
     return bestTile, bestRisk
@@ -2033,34 +2602,62 @@ local function VerifyPendingFlags(): ()
     end
 end
 
-local function GetNearbyMines(): {CandidateData}
-    local candidates: {CandidateData} = TableCreate(50)
-    local candidateCount: number = 0
+local function RefreshAutoFlagCandidates(): ()
+    local currentTime: number = OsClock()
+    
+    if currentTime - LastAutoFlagScanTime < AUTOFLAG_SCAN_INTERVAL then
+        return
+    end
+    
+    LastAutoFlagScanTime = currentTime
+    
+    CachedMineCandidateCount = 0
+    CachedWrongFlagCandidateCount = 0
     
     if not HumanoidRootPart or not CheckParentValid(HumanoidRootPart) then
-        return candidates
+        return
     end
     
     local success: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
-    if not success or not charPos then return candidates end
+    if not success or not charPos then return end
     
-    local charVec: vector = VectorCreate(charPos.X, charPos.Y, charPos.Z)
+    local charX: number = charPos.X
+    local charY: number = charPos.Y
+    local charZ: number = charPos.Z
+    local rangeSq: number = AUTOFLAG_MAX_RANGE * AUTOFLAG_MAX_RANGE
     
     for i = 1, TileCount do
-        local tile: TileData = Tiles[i]
+        if CachedMineCandidateCount >= AUTOFLAG_MAX_CANDIDATES and CachedWrongFlagCandidateCount >= AUTOFLAG_MAX_CANDIDATES then
+            break
+        end
+        
+        local tile: TileData? = Tiles[i]
+        if not tile then continue end
+        if not tile.storedPos then continue end
+        
+        local tilePos: Vector3 = tile.storedPos
+        local dx: number = tilePos.X - charX
+        local dy: number = tilePos.Y - charY
+        local dz: number = tilePos.Z - charZ
+        local distSq: number = dx * dx + dy * dy + dz * dz
+        
+        if distSq > rangeSq then continue end
+        
+        local dist: number = MathSqrt(distSq)
+        local tileVec: vector = VectorCreate(tilePos.X, tilePos.Y, tilePos.Z)
         
         if tile.predicted == "mine" and not tile.flagged and tile.tileType ~= "mine" then
             if tile.part and CheckParentValid(tile.part) then
                 if not CheckIfFlagged(tile.part) then
-                    local posSuccess: boolean, tilePos: Vector3? = SafeGetProperty(tile.part, "Position")
-                    
-                    if posSuccess and tilePos then
-                        local tileVec: vector = VectorCreate(tilePos.X, tilePos.Y, tilePos.Z)
-                        local dist: number = ComputeDistance3D(charVec, tileVec)
-                        
-                        if dist <= AUTOFLAG_MAX_RANGE then
-                            candidateCount = candidateCount + 1
-                            candidates[candidateCount] = {
+                    if CachedMineCandidateCount < AUTOFLAG_MAX_CANDIDATES then
+                        CachedMineCandidateCount = CachedMineCandidateCount + 1
+                        local candidate: CandidateData? = CachedMineCandidates[CachedMineCandidateCount]
+                        if candidate then
+                            candidate.tile = tile
+                            candidate.distance = dist
+                            candidate.position = tileVec
+                        else
+                            CachedMineCandidates[CachedMineCandidateCount] = {
                                 tile = tile,
                                 distance = dist,
                                 position = tileVec
@@ -2069,44 +2666,18 @@ local function GetNearbyMines(): {CandidateData}
                     end
                 end
             end
-        end
-    end
-    
-    TableSort(candidates, function(a: CandidateData, b: CandidateData): boolean
-        return a.distance < b.distance
-    end)
-    
-    return candidates
-end
-
-local function GetNearbyWrongFlags(): {CandidateData}
-    local candidates: {CandidateData} = TableCreate(50)
-    local candidateCount: number = 0
-    
-    if not HumanoidRootPart or not CheckParentValid(HumanoidRootPart) then
-        return candidates
-    end
-    
-    local success: boolean, charPos: Vector3? = SafeGetProperty(HumanoidRootPart, "Position")
-    if not success or not charPos then return candidates end
-    
-    local charVec: vector = VectorCreate(charPos.X, charPos.Y, charPos.Z)
-    
-    for i = 1, TileCount do
-        local tile: TileData = Tiles[i]
-        
-        if tile.predicted == "safe" and tile.tileType == "unknown" then
+        elseif tile.predicted == "safe" and tile.tileType == "unknown" then
             if tile.part and CheckParentValid(tile.part) then
                 if CheckIfFlagged(tile.part) then
-                    local posSuccess: boolean, tilePos: Vector3? = SafeGetProperty(tile.part, "Position")
-                    
-                    if posSuccess and tilePos then
-                        local tileVec: vector = VectorCreate(tilePos.X, tilePos.Y, tilePos.Z)
-                        local dist: number = ComputeDistance3D(charVec, tileVec)
-                        
-                        if dist <= AUTOFLAG_MAX_RANGE then
-                            candidateCount = candidateCount + 1
-                            candidates[candidateCount] = {
+                    if CachedWrongFlagCandidateCount < AUTOFLAG_MAX_CANDIDATES then
+                        CachedWrongFlagCandidateCount = CachedWrongFlagCandidateCount + 1
+                        local candidate: CandidateData? = CachedWrongFlagCandidates[CachedWrongFlagCandidateCount]
+                        if candidate then
+                            candidate.tile = tile
+                            candidate.distance = dist
+                            candidate.position = tileVec
+                        else
+                            CachedWrongFlagCandidates[CachedWrongFlagCandidateCount] = {
                                 tile = tile,
                                 distance = dist,
                                 position = tileVec
@@ -2118,66 +2689,133 @@ local function GetNearbyWrongFlags(): {CandidateData}
         end
     end
     
-    TableSort(candidates, function(a: CandidateData, b: CandidateData): boolean
-        return a.distance < b.distance
-    end)
+    if CachedMineCandidateCount > 1 then
+        for i = 1, CachedMineCandidateCount - 1 do
+            local minIdx: number = i
+            for j = i + 1, CachedMineCandidateCount do
+                if CachedMineCandidates[j].distance < CachedMineCandidates[minIdx].distance then
+                    minIdx = j
+                end
+            end
+            if minIdx ~= i then
+                local temp: CandidateData = CachedMineCandidates[i]
+                CachedMineCandidates[i] = CachedMineCandidates[minIdx]
+                CachedMineCandidates[minIdx] = temp
+            end
+        end
+    end
     
-    return candidates
+    if CachedWrongFlagCandidateCount > 1 then
+        for i = 1, CachedWrongFlagCandidateCount - 1 do
+            local minIdx: number = i
+            for j = i + 1, CachedWrongFlagCandidateCount do
+                if CachedWrongFlagCandidates[j].distance < CachedWrongFlagCandidates[minIdx].distance then
+                    minIdx = j
+                end
+            end
+            if minIdx ~= i then
+                local temp: CandidateData = CachedWrongFlagCandidates[i]
+                CachedWrongFlagCandidates[i] = CachedWrongFlagCandidates[minIdx]
+                CachedWrongFlagCandidates[minIdx] = temp
+            end
+        end
+    end
 end
 
-local LastTargetScreenPos: vector? = nil
-local MouseStableFrames: number = 0
-local IsUnflagging: boolean = false
+local function GetCachedNearbyMines(): (CandidateData?, CandidateData?)
+    if CachedMineCandidateCount >= 1 then
+        return CachedMineCandidates[1], CachedMineCandidates[2]
+    end
+    return nil, nil
+end
+
+local function GetCachedNearbyWrongFlags(): (CandidateData?, CandidateData?)
+    if CachedWrongFlagCandidateCount >= 1 then
+        return CachedWrongFlagCandidates[1], CachedWrongFlagCandidates[2]
+    end
+    return nil, nil
+end
+
 
 local function ProcessAutoFlag(): ()
     if not _G.MS_AUTOFLAG then
         LockedTarget = nil
+        NextTargetQueued = nil
         LastTargetScreenPos = nil
         MouseStableFrames = 0
         IsUnflagging = false
         return
     end
     
-    VerifyPendingFlags()
-    
     local currentTime: number = OsClock()
+    
+    VerifyPendingFlags()
+    RefreshAutoFlagCandidates()
     
     if LockedTarget then
         local tile: TileData = LockedTarget.tile
+        local isInvalid: boolean = false
         
-        if IsUnflagging then
-            if not tile.part or not CheckParentValid(tile.part) or not CheckIfFlagged(tile.part) or tile.tileType ~= "unknown" then
-                LockedTarget = nil
-                LastTargetScreenPos = nil
-                MouseStableFrames = 0
-                IsUnflagging = false
+        if not tile.part then
+            isInvalid = true
+        elseif not CheckParentValid(tile.part) then
+            isInvalid = true
+        elseif IsUnflagging then
+            if not CheckIfFlagged(tile.part) or tile.tileType ~= "unknown" then
+                isInvalid = true
             end
         else
-            if not tile.part or not CheckParentValid(tile.part) or tile.flagged or
-               CheckIfFlagged(tile.part) or tile.tileType ~= "unknown" then
-                LockedTarget = nil
-                LastTargetScreenPos = nil
-                MouseStableFrames = 0
+            if tile.flagged or CheckIfFlagged(tile.part) or tile.tileType ~= "unknown" then
+                isInvalid = true
+            end
+        end
+        
+        if isInvalid then
+            LockedTarget = NextTargetQueued
+            NextTargetQueued = nil
+            LastTargetScreenPos = nil
+            MouseStableFrames = 0
+            if not LockedTarget then
+                IsUnflagging = false
             end
         end
     end
     
     if not LockedTarget then
-        local wrongFlags: {CandidateData} = GetNearbyWrongFlags()
+        local wrongFlag1: CandidateData?, wrongFlag2: CandidateData? = GetCachedNearbyWrongFlags()
         
-        if #wrongFlags > 0 then
-            LockedTarget = wrongFlags[1]
+        if wrongFlag1 then
+            LockedTarget = wrongFlag1
+            NextTargetQueued = wrongFlag2
             LastTargetScreenPos = nil
             MouseStableFrames = 0
             IsUnflagging = true
         else
-            local nearbyMines: {CandidateData} = GetNearbyMines()
+            local mine1: CandidateData?, mine2: CandidateData? = GetCachedNearbyMines()
             
-            if #nearbyMines > 0 then
-                LockedTarget = nearbyMines[1]
+            if mine1 then
+                LockedTarget = mine1
+                NextTargetQueued = mine2
                 LastTargetScreenPos = nil
                 MouseStableFrames = 0
                 IsUnflagging = false
+            end
+        end
+    elseif not NextTargetQueued then
+        if IsUnflagging then
+            local wrongFlag1: CandidateData?, wrongFlag2: CandidateData? = GetCachedNearbyWrongFlags()
+            if wrongFlag2 then
+                NextTargetQueued = wrongFlag2
+            elseif not wrongFlag1 then
+                local mine1: CandidateData?, mine2: CandidateData? = GetCachedNearbyMines()
+                if mine1 then
+                    NextTargetQueued = mine1
+                end
+            end
+        else
+            local mine1: CandidateData?, mine2: CandidateData? = GetCachedNearbyMines()
+            if mine2 then
+                NextTargetQueued = mine2
             end
         end
     end
@@ -2201,69 +2839,53 @@ local function ProcessAutoFlag(): ()
                 else
                     MouseStableFrames = MouseStableFrames + 1
                     
-                    if MouseStableFrames >= 3 and currentTime - LastClickTime >= AUTOFLAG_CLICK_DELAY then
-                        if IsUnflagging then
-                            if CheckIfFlagged(LockedTarget.tile.part) then
-                                local tileType: string = DetermineTileType(LockedTarget.tile.part)
+                    if MouseStableFrames >= 2 and currentTime - LastClickTime >= AUTOFLAG_CLICK_DELAY then
+                        local shouldClick: boolean = false
+                        local tileType: string = DetermineTileType(LockedTarget.tile.part)
+                        
+                        if tileType == "unknown" then
+                            if IsUnflagging then
+                                shouldClick = CheckIfFlagged(LockedTarget.tile.part)
+                            else
+                                shouldClick = not CheckIfFlagged(LockedTarget.tile.part)
+                            end
+                        end
+                        
+                        if shouldClick then
+                            local clickSuccess: boolean = SafeMouse1Click()
+                            
+                            if clickSuccess then
+                                LastClickTime = currentTime
                                 
-                                if tileType == "unknown" then
-                                    local clickSuccess: boolean = SafeMouse1Click()
-                                    
-                                    if clickSuccess then
-                                        LastClickTime = currentTime
-                                        
-                                        PendingVerifications[#PendingVerifications + 1] = {
-                                            tile = LockedTarget.tile,
-                                            time = currentTime
-                                        }
-                                        
-                                        LockedTarget = nil
-                                        LastTargetScreenPos = nil
-                                        MouseStableFrames = 0
-                                        IsUnflagging = false
-                                    end
-                                else
-                                    LockedTarget = nil
-                                    LastTargetScreenPos = nil
-                                    MouseStableFrames = 0
+                                if not IsUnflagging then
+                                    LockedTarget.tile.flagged = true
+                                end
+                                
+                                if #PendingVerifications < MAX_PENDING_VERIFICATIONS then
+                                    PendingVerifications[#PendingVerifications + 1] = {
+                                        tile = LockedTarget.tile,
+                                        time = currentTime
+                                    }
+                                end
+                                
+                                LockedTarget = NextTargetQueued
+                                NextTargetQueued = nil
+                                LastTargetScreenPos = nil
+                                MouseStableFrames = 0
+                                
+                                LastAutoFlagScanTime = 0
+                                
+                                if not LockedTarget then
                                     IsUnflagging = false
                                 end
-                            else
-                                LockedTarget = nil
-                                LastTargetScreenPos = nil
-                                MouseStableFrames = 0
-                                IsUnflagging = false
                             end
                         else
-                            if not CheckIfFlagged(LockedTarget.tile.part) then
-                                local tileType: string = DetermineTileType(LockedTarget.tile.part)
-                                
-                                if tileType == "unknown" then
-                                    local clickSuccess: boolean = SafeMouse1Click()
-                                    
-                                    if clickSuccess then
-                                        LastClickTime = currentTime
-                                        LockedTarget.tile.flagged = true
-                                        
-                                        PendingVerifications[#PendingVerifications + 1] = {
-                                            tile = LockedTarget.tile,
-                                            time = currentTime
-                                        }
-                                        
-                                        LockedTarget = nil
-                                        LastTargetScreenPos = nil
-                                        MouseStableFrames = 0
-                                    end
-                                else
-                                    LockedTarget = nil
-                                    LastTargetScreenPos = nil
-                                    MouseStableFrames = 0
-                                end
-                            else
-                                LockedTarget.tile.flagged = true
-                                LockedTarget = nil
-                                LastTargetScreenPos = nil
-                                MouseStableFrames = 0
+                            LockedTarget = NextTargetQueued
+                            NextTargetQueued = nil
+                            LastTargetScreenPos = nil
+                            MouseStableFrames = 0
+                            if not LockedTarget then
+                                IsUnflagging = false
                             end
                         end
                     end
@@ -2272,10 +2894,13 @@ local function ProcessAutoFlag(): ()
                 LastTargetScreenPos = screenPos
             end
         else
-            LockedTarget = nil
+            LockedTarget = NextTargetQueued
+            NextTargetQueued = nil
             LastTargetScreenPos = nil
             MouseStableFrames = 0
-            IsUnflagging = false
+            if not LockedTarget then
+                IsUnflagging = false
+            end
         end
     end
 end
@@ -2415,21 +3040,23 @@ local function ReclassifyTiles(): ()
     for i = 1, TileCount do
         local t: TileData = Tiles[i]
         
-        local newType: string, newNumber: number? = DetermineTileType(t.part)
-        
-        if newType ~= t.tileType or newNumber ~= t.number then
-            t.tileType = newType
-            t.number = newNumber
-            t.hasRevealedNeighbor = nil
+        if t and t.part then
+            local newType: string, newNumber: number? = DetermineTileType(t.part)
             
-            if t.part and CheckParentValid(t.part) then
-                local posSuccess: boolean, pos: Vector3? = SafeGetProperty(t.part, "Position")
-                if posSuccess and pos then
-                    t.storedPos = pos
+            if newType ~= t.tileType or newNumber ~= t.number then
+                t.tileType = newType
+                t.number = newNumber
+                t.hasRevealedNeighbor = nil
+                
+                if CheckParentValid(t.part) then
+                    local posSuccess: boolean, pos: Vector3? = SafeGetProperty(t.part, "Position")
+                    if posSuccess and pos then
+                        t.storedPos = pos
+                    end
                 end
+                
+                SolverChanged = true
             end
-            
-            SolverChanged = true
         end
     end
 end
@@ -2438,7 +3065,10 @@ local function PrepareRenderData(): ()
     RenderCount = 0
     
     for i = 1, TileCount do
-        local t: TileData = Tiles[i]
+        if RenderCount >= MAX_RENDER_TILES then break end
+        
+        local t: TileData? = Tiles[i]
+        if not t then continue end
         
         if t.tileType == "unknown" then
             if t.predicted == "mine" or t.predicted == "safe" then
@@ -2536,21 +3166,100 @@ local function SafePostModel(): ()
     Pcall(PrepareRenderData)
     Pcall(PerformMemoryCleanup)
     Pcall(ValidateStaleTiles)
-    Pcall(UpdateWalkPath)
+    Pcall(PerformDeepCleanup)
 end
 
-local function SafePreLocal(): ()
-    if not _G.MS_RUN then return end
+local function CleanupWalkMemory(): ()
+    if not _G.MS_AUTOWALK and not WalkData.active then
+        TrimPool(PathNodePool, 0)
+        
+        TableClear(PathCameFrom)
+        TableClear(PathGScore)
+        TableClear(PathFScore)
+        TableClear(PathClosedSet)
+        
+        for i = #PathOpenSet, 1, -1 do
+            PathOpenSet[i] = nil
+        end
+    end
+end
+
+local function CleanupAutoFlagMemory(): ()
+    if not _G.MS_AUTOFLAG then
+        LockedTarget = nil
+        NextTargetQueued = nil
+        LastTargetScreenPos = nil
+        MouseStableFrames = 0
+        IsUnflagging = false
+        
+        for i = #PendingVerifications, 1, -1 do
+            PendingVerifications[i] = nil
+        end
+        
+        CachedMineCandidateCount = 0
+        CachedWrongFlagCandidateCount = 0
+        LastAutoFlagScanTime = 0
+    end
+end
+
+local function CleanupRenderMemory(): ()
+    local currentTime: number = OsClock()
+    
+    if currentTime - LastScreenCacheTime > 5 then
+        TableClear(CachedScreenPositions)
+        LastScreenCacheTime = currentTime
+    end
+    
+    for i = RenderCount + 1, #RenderData do
+        RenderData[i] = nil
+    end
+end
+
+local function SafePostLocal(): ()
+    if not _G.MS_RUN then
+        ResetAllState()
+        return
+    end
     
     Pcall(UpdateReferences)
     Pcall(ProcessInput)
     Pcall(ProcessAutoFlag)
     Pcall(ExecuteWalkMovement)
+    Pcall(UpdateWalkPath)
+    Pcall(CleanupWalkMemory)
+    Pcall(CleanupAutoFlagMemory)
+end
+
+local function UpdateScreenPositionCache(): ()
+    local currentTime: number = OsClock()
+    
+    if currentTime - LastScreenCacheTime < SCREEN_CACHE_INTERVAL then
+        return
+    end
+    
+    LastScreenCacheTime = currentTime
+    
+    if not Camera then return end
+    
+    for i = 1, RenderCount do
+        local t: TileData? = RenderData[i]
+        if not t or not t.storedPos then continue end
+        
+        local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, t.storedPos)
+        
+        if screenPos and onScreen then
+            CachedScreenPositions[t] = VectorCreate(screenPos.X, screenPos.Y, 0)
+        else
+            CachedScreenPositions[t] = nil
+        end
+    end
 end
 
 local function SafeRender(): ()
     if not _G.MS_RUN then return end
     if not Camera then return end
+    
+    UpdateScreenPositionCache()
     
     local flagColor: Color3 = _G.MS_AUTOFLAG and COLOR_STATUS_ON or COLOR_STATUS_OFF
     local flagText: string = _G.MS_AUTOFLAG and "FLAG: ON (X)" or "FLAG: OFF (X)"
@@ -2561,19 +3270,23 @@ local function SafeRender(): ()
     SafeDrawText(VectorCreate(12, 785, 0), 16, flagColor, 1, flagText, false)
     SafeDrawText(VectorCreate(12, 805, 0), 16, walkColor, 1, walkText, false)
     
-    if BestMove and BestMove.part and CheckParentValid(BestMove.part) then
-        if BestMove.storedPos then
+    if BestMove and BestMove.storedPos then
+        local cachedPos: vector? = CachedScreenPositions[BestMove]
+        if not cachedPos then
             local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, BestMove.storedPos)
-            
             if screenPos and onScreen then
-                local riskText: string = "BEST"
-                if BestMoveRisk > 0 then
-                    local pct: number = MathFloor(BestMoveRisk * 100 + 0.5)
-                    riskText = "BEST (" .. tostring(pct) .. "%)"
-                end
-                
-                SafeDrawText(VectorCreate(screenPos.X, screenPos.Y - 30, 0), 18, COLOR_BEST, 1, riskText, true)
+                cachedPos = VectorCreate(screenPos.X, screenPos.Y, 0)
             end
+        end
+        
+        if cachedPos then
+            local riskText: string = "BEST"
+            if BestMoveRisk > 0 then
+                local pct: number = MathFloor(BestMoveRisk * 100 + 0.5)
+                riskText = "BEST (" .. tostring(pct) .. "%)"
+            end
+            
+            SafeDrawText(VectorCreate(cachedPos.X, cachedPos.Y - 30, 0), 18, COLOR_BEST, 1, riskText, true)
         end
     end
     
@@ -2582,32 +3295,35 @@ local function SafeRender(): ()
     
     for i = 1, renderCount do
         local t: TileData? = RenderData[i]
+        if not t then continue end
         
-        if t and t.storedPos then
-            local screenPos: vector?, onScreen: boolean = SafeWorldToScreen(Camera, t.storedPos)
-            
-            if screenPos and onScreen then
-                local screenVec: vector = VectorCreate(screenPos.X, screenPos.Y, 0)
+        local screenVec: vector? = CachedScreenPositions[t]
+        if not screenVec then continue end
+        
+        local predicted: string | boolean = t.predicted
+        
+        if predicted == "mine" then
+            SafeDrawText(screenVec, 22, COLOR_MINE, 1, "M", true)
+        elseif predicted == "safe" then
+            SafeDrawText(screenVec, 22, COLOR_SAFE, 1, "S", true)
+        else
+            local prob: number? = t.probability
+            if prob and prob > 0 and prob < 1 then
+                local pct: number = MathFloor(prob * 100 + 0.5)
+                if pct <= 0 then pct = 1 end
+                if pct >= 100 then pct = 99 end
                 
-                if t.predicted == "mine" then
-                    SafeDrawText(screenVec, 22, COLOR_MINE, 1, "M", true)
-                elseif t.predicted == "safe" then
-                    SafeDrawText(screenVec, 22, COLOR_SAFE, 1, "S", true)
-                elseif t.probability and t.probability > 0 and t.probability < 1 then
-                    local pct: number = MathFloor(t.probability * 100 + 0.5)
-                    if pct <= 0 then pct = 1 end
-                    if pct >= 100 then pct = 99 end
-                    
-                    local probColor: Color3? = PROB_COLORS[pct]
-                    local probText: string? = PROB_TEXTS[pct]
-                    
-                    if probColor and probText then
-                        SafeDrawText(screenVec, 22, probColor, 1, probText, true)
-                    end
+                local probColor: Color3? = PROB_COLORS[pct]
+                local probText: string? = PROB_TEXTS[pct]
+                
+                if probColor and probText then
+                    SafeDrawText(screenVec, 22, probColor, 1, probText, true)
                 end
             end
         end
     end
+    
+    CleanupRenderMemory()
 end
 
 Pcall(Initialize)
@@ -2616,8 +3332,8 @@ RunService.PostModel:Connect(function(): ()
     Pcall(SafePostModel)
 end)
 
-RunService.PreLocal:Connect(function(): ()
-    Pcall(SafePreLocal)
+RunService.PostLocal:Connect(function(): ()
+    Pcall(SafePostLocal)
 end)
 
 RunService.Render:Connect(function(): ()
